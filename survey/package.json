@@ -1,0 +1,14 @@
+{
+  "name": "behold-christian-dating-survey",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A faith-tailored research survey for a Nigerian Christian dating app (BEHOLD), with a password-protected response dashboard.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "UNLICENSED"
+}

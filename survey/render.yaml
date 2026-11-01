@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: behold-survey
+    runtime: node
+    plan: free
+    buildCommand: echo "No build step needed"
+    startCommand: node server.js
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: HOST
+        value: 0.0.0.0
+      - key: ADMIN_PASSWORD
+        generateValue: true
+      - key: COOKIE_SECURE
+        value: "1"
+      - key: DATA_DIR
+        value: /data
+    disk:
+      name: behold-data
+      mountPath: /data
+      sizeGB: 1
