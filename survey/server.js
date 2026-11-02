@@ -2,10 +2,12 @@
 
 /*
  * BEHOLD survey server.
- * Zero npm dependencies: just Node.js 18+ (tested on Node 24).
+ * Requires Node.js 18+ and a PostgreSQL database (Supabase free tier works).
  *
- *   node server.js            -> http://localhost:4173
+ *   DATABASE_URL=postgresql://... node server.js   -> http://localhost:4173
  *   ADMIN_PASSWORD=... node server.js
+ *
+ * Falls back to flat-file storage if DATABASE_URL is not set (local dev).
  */
 
 const http = require("http");
@@ -18,8 +20,6 @@ const SURVEY = require("./public/js/questions.js");
 
 const ROOT = __dirname;
 const PUBLIC_DIR = path.join(ROOT, "public");
-// On Render, responses are stored on the mounted persistent disk at /data.
-// Locally they fall back to ./data inside the project folder.
 const DATA_DIR = process.env.DATA_DIR || path.join(ROOT, "data");
 const RESPONSES_FILE = path.join(DATA_DIR, "responses.jsonl");
 const SECRET_FILE = path.join(DATA_DIR, ".session-secret");
@@ -28,6 +28,7 @@ const PORT = Number(process.env.PORT) || 4173;
 const HOST = process.env.HOST || "0.0.0.0";
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "behold-admin";
 const IS_DEFAULT_PASSWORD = !process.env.ADMIN_PASSWORD;
+const DATABASE_URL = process.env.DATABASE_URL || null;
 const SESSION_HOURS = 12;
 const MAX_BODY_BYTES = 150 * 1024;
 const MAX_TEXT_LENGTH = 2000;
@@ -74,6 +75,36 @@ function safeEqual(a, b) {
   const bufB = Buffer.isBuffer(b) ? b : Buffer.from(String(b));
   if (bufA.length !== bufB.length) return false;
   return crypto.timingSafeEqual(bufA, bufB);
+}
+
+/* ------------------------------------------------------------------ */
+/* PostgreSQL pool (only when DATABASE_URL is set)                     */
+/* ------------------------------------------------------------------ */
+
+let pool = null;
+
+async function initDb() {
+  if (!DATABASE_URL) return;
+  try {
+    const { Pool } = require("pg");
+    pool = new Pool({
+      connectionString: DATABASE_URL,
+      ssl: { rejectUnauthorized: false },
+      max: 5
+    });
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS survey_responses (
+        id          TEXT PRIMARY KEY,
+        created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        data        JSONB NOT NULL
+      )
+    `);
+    console.log("  [db] PostgreSQL connected and table ready.");
+  } catch (err) {
+    console.error("  [db] Failed to connect to PostgreSQL:", err.message);
+    console.error("  [db] Falling back to flat-file storage.");
+    pool = null;
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -243,10 +274,21 @@ function readBody(req) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Response storage                                                    */
+/* Response storage — PostgreSQL when available, flat-file fallback   */
 /* ------------------------------------------------------------------ */
 
+function rowToRecord(row) {
+  return row.data;
+}
+
 async function readResponses() {
+  if (pool) {
+    const result = await pool.query(
+      "SELECT data FROM survey_responses ORDER BY created_at DESC"
+    );
+    return result.rows.map(rowToRecord);
+  }
+  /* flat-file fallback */
   let raw;
   try {
     raw = await fsp.readFile(RESPONSES_FILE, "utf8");
@@ -260,23 +302,40 @@ async function readResponses() {
     if (!trimmed) return;
     try {
       out.push(JSON.parse(trimmed));
-    } catch (_) {
-      /* skip corrupt line rather than losing the whole dataset */
-    }
+    } catch (_) { /* skip corrupt line */ }
   });
   return out;
 }
 
 async function appendResponse(record) {
+  if (pool) {
+    await pool.query(
+      "INSERT INTO survey_responses (id, created_at, data) VALUES ($1, $2, $3)",
+      [record.id, record.createdAt, record]
+    );
+    return;
+  }
   await fsp.appendFile(RESPONSES_FILE, JSON.stringify(record) + "\n", "utf8");
 }
 
 async function deleteResponse(id) {
+  if (pool) {
+    const result = await pool.query(
+      "DELETE FROM survey_responses WHERE id = $1",
+      [id]
+    );
+    return result.rowCount > 0;
+  }
+  /* flat-file fallback */
   const responses = await readResponses();
   const remaining = responses.filter((item) => item.id !== id);
   if (remaining.length === responses.length) return false;
   const temp = RESPONSES_FILE + ".tmp";
-  await fsp.writeFile(temp, remaining.map((item) => JSON.stringify(item)).join("\n") + "\n", "utf8");
+  await fsp.writeFile(
+    temp,
+    remaining.map((item) => JSON.stringify(item)).join("\n") + "\n",
+    "utf8"
+  );
   await fsp.rename(temp, RESPONSES_FILE);
   return true;
 }
@@ -284,7 +343,7 @@ async function deleteResponse(id) {
 function newId() {
   const stamp = Date.now().toString(36).toUpperCase().slice(-6);
   const random = crypto.randomBytes(3).toString("hex").toUpperCase();
-  return `CR-${stamp}-${random}`;
+  return `BHL-${stamp}-${random}`;
 }
 
 /* ------------------------------------------------------------------ */
@@ -534,7 +593,11 @@ async function handle(req, res) {
   const method = req.method || "GET";
 
   if (pathname === "/api/health" && method === "GET") {
-    return sendJson(res, 200, { ok: true, surveyVersion: SURVEY.version });
+    return sendJson(res, 200, {
+      ok: true,
+      surveyVersion: SURVEY.version,
+      storage: pool ? "postgresql" : "file"
+    });
   }
 
   /* ----- public: submit a response ----- */
@@ -551,7 +614,6 @@ async function handle(req, res) {
 
     const body = await readBody(req);
     if (body.website) {
-      /* honeypot filled by a bot: pretend success, store nothing */
       return sendJson(res, 201, { ok: true, id: newId(), discarded: true });
     }
     if (body.consent !== true) {
@@ -589,10 +651,13 @@ async function handle(req, res) {
     };
 
     await appendResponse(record);
+    const total = pool
+      ? (await pool.query("SELECT COUNT(*) FROM survey_responses")).rows[0].count
+      : (await readResponses()).length;
     console.log(
       `[response] ${record.id} status=${record.status} duration=${
         durationSeconds === null ? "?" : durationSeconds + "s"
-      } total=${(await readResponses()).length}`
+      } total=${total}`
     );
     return sendJson(res, 201, { ok: true, id: record.id });
   }
@@ -706,34 +771,37 @@ async function handle(req, res) {
   return serveStatic(req, res, pathname);
 }
 
-const server = http.createServer((req, res) => {
-  handle(req, res).catch((error) => {
-    const status = error.status || 500;
-    if (status === 413) {
-      res.setHeader("Connection", "close");
-    }
-    if (status >= 500) console.error("[error]", error);
-    if (!res.headersSent) {
-      sendJson(res, status, { error: status >= 500 ? "Something went wrong." : error.message });
-    } else {
-      res.end();
-    }
-  });
-});
+/* ------------------------------------------------------------------ */
+/* Start                                                               */
+/* ------------------------------------------------------------------ */
 
-server.listen(PORT, HOST, () => {
-  const shownHost = HOST === "0.0.0.0" ? "localhost" : HOST;
-  console.log("");
-  console.log("  BEHOLD — Christian Dating Survey");
-  console.log("  ---------------------------------");
-  console.log(`  Survey   http://${shownHost}:${PORT}/`);
-  console.log(`  Admin    http://${shownHost}:${PORT}/admin`);
-  console.log(`  Data     ${RESPONSES_FILE}`);
-  if (IS_DEFAULT_PASSWORD) {
+initDb().then(() => {
+  const server = http.createServer((req, res) => {
+    handle(req, res).catch((error) => {
+      const status = error.status || 500;
+      if (status === 413) res.setHeader("Connection", "close");
+      if (status >= 500) console.error("[error]", error);
+      if (!res.headersSent) {
+        sendJson(res, status, { error: status >= 500 ? "Something went wrong." : error.message });
+      } else {
+        res.end();
+      }
+    });
+  });
+
+  server.listen(PORT, HOST, () => {
+    const shownHost = HOST === "0.0.0.0" ? "localhost" : HOST;
     console.log("");
-    console.log("  ! Admin password is the default: behold-admin");
-    console.log("    Set a real one before sharing this link:");
-    console.log("    ADMIN_PASSWORD=your-password node server.js");
-  }
-  console.log("");
+    console.log("  BEHOLD — Christian Dating Survey");
+    console.log("  ---------------------------------");
+    console.log(`  Survey   http://${shownHost}:${PORT}/`);
+    console.log(`  Admin    http://${shownHost}:${PORT}/admin`);
+    console.log(`  Storage  ${pool ? "PostgreSQL (Supabase)" : RESPONSES_FILE}`);
+    if (IS_DEFAULT_PASSWORD) {
+      console.log("");
+      console.log("  ! Admin password is the default: behold-admin");
+      console.log("    Set a real one: ADMIN_PASSWORD=your-password node server.js");
+    }
+    console.log("");
+  });
 });
